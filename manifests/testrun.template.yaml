@@ -1,0 +1,38 @@
+# TestRun template renderizado por el workflow .github/workflows/run-test.yml.
+# Variables sustituidas con envsubst:
+#   ${TEST_NAME} ${NAMESPACE} ${PARALLELISM} ${TARGET_URL} ${SCRIPT_FILE} ${RUNNER_IMAGE}
+apiVersion: k6.io/v1alpha1
+kind: TestRun
+metadata:
+  name: ${TEST_NAME}
+  namespace: ${NAMESPACE}
+spec:
+  parallelism: ${PARALLELISM}
+  cleanup: post
+  script:
+    configMap:
+      name: k6-script-${TEST_NAME}
+      file: ${SCRIPT_FILE}
+  arguments: --out xk6-influxdb=http://influxdb:8181 --tag testid=${TEST_NAME}
+  runner:
+    image: ${RUNNER_IMAGE}
+    imagePullPolicy: Always
+    env:
+      - name: TARGET_URL
+        value: "${TARGET_URL}"
+      - name: K6_INFLUXDB_ORGANIZATION
+        value: "default"
+      - name: K6_INFLUXDB_BUCKET
+        value: "k6"
+      - name: K6_INFLUXDB_TOKEN
+        valueFrom:
+          secretKeyRef:
+            name: influxdb-admin-token
+            key: token
+    resources:
+      requests:
+        cpu: 200m
+        memory: 256Mi
+      limits:
+        cpu: "1"
+        memory: 512Mi

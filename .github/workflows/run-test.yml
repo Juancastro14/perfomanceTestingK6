@@ -1,0 +1,130 @@
+name: Run k6 load test
+
+on:
+  workflow_dispatch:
+    inputs:
+      suite:
+        description: 'Test suite (script bajo scripts/)'
+        type: choice
+        options:
+          - load-test
+        default: load-test
+      parallelism:
+        description: 'Numero de pods runner (los VU del script se dividen entre ellos)'
+        type: number
+        default: 4
+      target_url:
+        description: 'URL bajo prueba'
+        type: string
+        default: 'https://test.k6.io'
+      test_name_prefix:
+        description: 'Prefijo del TestRun (se le agrega run_number para evitar colisiones)'
+        type: string
+        default: 'qa-load'
+      namespace:
+        description: 'Namespace destino'
+        type: choice
+        options:
+          - compute-resources-area-calidad-dev
+        default: compute-resources-area-calidad-dev
+
+permissions:
+  contents: read
+
+jobs:
+  run-k6:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    env:
+      NAMESPACE: ${{ inputs.namespace }}
+      TEST_NAME: ${{ inputs.test_name_prefix }}-${{ github.run_number }}
+      SUITE: ${{ inputs.suite }}
+      PARALLELISM: ${{ inputs.parallelism }}
+      TARGET_URL: ${{ inputs.target_url }}
+      RUNNER_IMAGE: ghcr.io/juancastro14/k6-influxdb:latest
+      KUBECONFIG: ${{ runner.temp }}/kubeconfig
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup kubectl
+        uses: azure/setup-kubectl@v4
+        with:
+          version: 'v1.30.0'
+
+      - name: Write kubeconfig
+        run: |
+          if [ -z "${{ secrets.KUBECONFIG_DATA }}" ]; then
+            echo "::error::KUBECONFIG_DATA secret is not set. Configurar en Settings > Secrets and variables > Actions."
+            exit 1
+          fi
+          printf '%s' "${{ secrets.KUBECONFIG_DATA }}" | base64 -d > "$KUBECONFIG"
+          chmod 600 "$KUBECONFIG"
+
+      - name: Verify cluster access
+        run: |
+          kubectl auth can-i create testruns.k6.io -n "$NAMESPACE"
+          kubectl -n "$NAMESPACE" get crd testruns.k6.io >/dev/null
+
+      - name: Resolve script path
+        id: script
+        run: |
+          SCRIPT_PATH="scripts/${SUITE}.js"
+          if [ ! -f "$SCRIPT_PATH" ]; then
+            echo "::error::Script no encontrado: $SCRIPT_PATH"
+            exit 1
+          fi
+          echo "script_path=$SCRIPT_PATH" >> "$GITHUB_OUTPUT"
+          echo "script_file=${SUITE}.js" >> "$GITHUB_OUTPUT"
+
+      - name: Create script ConfigMap
+        run: |
+          kubectl create configmap "k6-script-${TEST_NAME}" \
+            --from-file="${{ steps.script.outputs.script_path }}" \
+            -n "$NAMESPACE" \
+            --dry-run=client -o yaml | kubectl apply -f -
+
+      - name: Render and apply TestRun
+        env:
+          SCRIPT_FILE: ${{ steps.script.outputs.script_file }}
+        run: |
+          envsubst < manifests/testrun.template.yaml > /tmp/testrun.yaml
+          echo "::group::Rendered TestRun"
+          cat /tmp/testrun.yaml
+          echo "::endgroup::"
+          kubectl apply -f /tmp/testrun.yaml
+
+      - name: Wait for runners to start
+        run: |
+          for i in $(seq 1 60); do
+            stage=$(kubectl -n "$NAMESPACE" get testrun "$TEST_NAME" -o jsonpath='{.status.stage}' 2>/dev/null || true)
+            echo "stage=${stage:-pending}"
+            if [ "$stage" = "started" ]; then
+              echo "Runners arrancaron."
+              break
+            fi
+            sleep 5
+          done
+
+      - name: Stream runner logs
+        run: |
+          kubectl -n "$NAMESPACE" logs -l "k6_cr=$TEST_NAME" -f --tail=200 --max-log-requests=20 || true
+
+      - name: Final status
+        if: always()
+        run: |
+          echo "## Resultado del TestRun \`$TEST_NAME\`" >> "$GITHUB_STEP_SUMMARY"
+          stage=$(kubectl -n "$NAMESPACE" get testrun "$TEST_NAME" -o jsonpath='{.status.stage}' 2>/dev/null || echo "unknown")
+          echo "- **Stage final:** \`$stage\`" >> "$GITHUB_STEP_SUMMARY"
+          echo "- **Parallelism:** $PARALLELISM" >> "$GITHUB_STEP_SUMMARY"
+          echo "- **Target:** $TARGET_URL" >> "$GITHUB_STEP_SUMMARY"
+          echo "- **Suite:** $SUITE" >> "$GITHUB_STEP_SUMMARY"
+          echo "- **Metricas:** revisar el dashboard k6 en Grafana, filtrar por \`testid=$TEST_NAME\`" >> "$GITHUB_STEP_SUMMARY"
+          kubectl -n "$NAMESPACE" describe testrun "$TEST_NAME" | tail -40 || true
+
+      - name: Cleanup
+        if: always()
+        run: |
+          kubectl -n "$NAMESPACE" delete testrun "$TEST_NAME" --ignore-not-found
+          kubectl -n "$NAMESPACE" delete configmap "k6-script-${TEST_NAME}" --ignore-not-found
