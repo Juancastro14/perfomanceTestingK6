@@ -38,6 +38,12 @@ jobs:
     # cambiar a 'ubuntu-latest'.
     runs-on: self-hosted
     timeout-minutes: 30
+    # El runner es Windows; sin esto PowerShell trata $NAMESPACE/$TEST_NAME
+    # como variables PS sin definir y kubectl recibe comandos rotos
+    # ("flags cannot be placed before plugin name: -n").
+    defaults:
+      run:
+        shell: bash
     env:
       NAMESPACE: ${{ inputs.namespace }}
       TEST_NAME: ${{ inputs.test_name_prefix }}-${{ github.run_number }}
