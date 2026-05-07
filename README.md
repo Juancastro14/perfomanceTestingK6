@@ -44,14 +44,39 @@ Convencion: cada script debe leer `__ENV.TARGET_URL` y declarar sus stages/scena
 
 ## Bootstrap (una sola vez)
 
-Para que el workflow pueda hablar con el cluster necesita un kubeconfig guardado como secret de GitHub. Esa configuracion la genera el equipo de plataforma desde el repo [k6_operator](https://github.com/Juancastro14/k6_operator) (ver `scripts/build-runner-kubeconfig.ps1` alli).
+Hay tres piezas para configurar antes del primer run:
 
-Resumen del bootstrap:
-1. Plataforma aplica la Application `k6-tests-rbac` (crea ServiceAccount + Role + token Secret).
-2. Plataforma genera el kubeconfig: `.\scripts\build-runner-kubeconfig.ps1 > runner-kubeconfig.yaml` y lo da en base64.
-3. Configurar en este repo: **Settings -> Secrets and variables -> Actions -> New repository secret**:
-   - Nombre: `KUBECONFIG_DATA`
-   - Valor: el contenido base64 generado.
+### 1) Self-hosted runner
+
+El cluster vive como `kind` local en la maquina del equipo de plataforma — los runners hosteados por GitHub no llegan a `127.0.0.1`. Por eso el workflow usa `runs-on: self-hosted` y el runner se instala en esa misma maquina.
+
+Pasos (los hace plataforma):
+
+1. En este repo: **Settings -> Actions -> Runners -> New self-hosted runner**.
+2. Elegir el OS (Windows en este caso) y seguir los comandos que da GitHub:
+   - Bajar el `actions-runner` ZIP.
+   - `./config.cmd --url https://github.com/Juancastro14/perfomanceTestingK6 --token <TOKEN>`
+   - `./run.cmd` (o instalar como servicio: `./svc.sh install` en Linux, `./svc.cmd install` en Windows).
+3. Verificar en Settings -> Actions -> Runners que aparezca `Idle`.
+
+> Cuando el cluster se mude a un AKS publico, cambiar `runs-on: self-hosted` por `ubuntu-latest` en [run-test.yml](.github/workflows/run-test.yml) y desmontar el runner.
+
+### 2) Kubeconfig como secret
+
+El workflow necesita un kubeconfig para hablar con el cluster. Lo genera plataforma desde el repo [k6_operator](https://github.com/Juancastro14/k6_operator):
+
+```powershell
+.\scripts\build-runner-kubeconfig.ps1 -Base64 > runner-kubeconfig.b64.txt
+```
+
+Despues, en este repo: **Settings -> Secrets and variables -> Actions -> New repository secret**:
+- Nombre: `KUBECONFIG_DATA`
+- Valor: el contenido (en base64) del archivo generado.
+
+### 3) Imagen del runner k6 publica en GHCR
+
+El TestRun usa `ghcr.io/juancastro14/k6-influxdb:latest`. La buildea el CI del repo [k6_operator](https://github.com/Juancastro14/k6_operator) en cada push a `main` que toque `docker/**`. Despues del primer build, hacer la package publica una sola vez:
+- https://github.com/Juancastro14?tab=packages -> `k6-influxdb` -> Package settings -> **Change visibility** -> Public.
 
 ## Limites
 

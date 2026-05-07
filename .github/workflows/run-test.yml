@@ -33,7 +33,10 @@ permissions:
 
 jobs:
   run-k6:
-    runs-on: ubuntu-latest
+    # Self-hosted porque el cluster (kind) corre en la maquina del platform team
+    # y solo es accesible via 127.0.0.1. Cuando migremos a AKS publico,
+    # cambiar a 'ubuntu-latest'.
+    runs-on: self-hosted
     timeout-minutes: 30
     env:
       NAMESPACE: ${{ inputs.namespace }}
@@ -42,7 +45,7 @@ jobs:
       PARALLELISM: ${{ inputs.parallelism }}
       TARGET_URL: ${{ inputs.target_url }}
       RUNNER_IMAGE: ghcr.io/juancastro14/k6-influxdb:latest
-      KUBECONFIG: ${{ runner.temp }}/kubeconfig
+      KUBECONFIG: ${{ github.workspace }}/.kubeconfig
 
     steps:
       - name: Checkout
