@@ -38,12 +38,13 @@ jobs:
     # cambiar a 'ubuntu-latest'.
     runs-on: self-hosted
     timeout-minutes: 30
-    # El runner es Windows; sin esto PowerShell trata $NAMESPACE/$TEST_NAME
-    # como variables PS sin definir y kubectl recibe comandos rotos
-    # ("flags cannot be placed before plugin name: -n").
+    # El runner es Windows; el shell por default es PowerShell, que no expande
+    # bash-style $VAR. Forzamos Git Bash. El "{0}" quoteado evita que bash
+    # interprete los backslashes del path Windows como escapes (sino aparece
+    # /bin/bash: C:Userselcasactions-runner_work_temp...sh: No such file).
     defaults:
       run:
-        shell: bash
+        shell: 'bash --noprofile --norc -eo pipefail "{0}"'
     env:
       NAMESPACE: ${{ inputs.namespace }}
       TEST_NAME: ${{ inputs.test_name_prefix }}-${{ github.run_number }}
