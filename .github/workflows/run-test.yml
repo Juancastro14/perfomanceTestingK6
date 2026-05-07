@@ -35,16 +35,14 @@ jobs:
   run-k6:
     # Self-hosted porque el cluster (kind) corre en la maquina del platform team
     # y solo es accesible via 127.0.0.1. Cuando migremos a AKS publico,
-    # cambiar a 'ubuntu-latest'.
+    # cambiar a 'ubuntu-latest' (y reescribir los steps en bash).
     runs-on: self-hosted
     timeout-minutes: 30
-    # El runner es Windows; el shell por default es PowerShell, que no expande
-    # bash-style $VAR. Forzamos Git Bash. El "{0}" quoteado evita que bash
-    # interprete los backslashes del path Windows como escapes (sino aparece
-    # /bin/bash: C:Userselcasactions-runner_work_temp...sh: No such file).
+    # PowerShell nativo de Windows para evitar el infierno de bash + paths
+    # Windows en self-hosted runners.
     defaults:
       run:
-        shell: 'bash --noprofile --norc -eo pipefail "{0}"'
+        shell: powershell
     env:
       NAMESPACE: ${{ inputs.namespace }}
       TEST_NAME: ${{ inputs.test_name_prefix }}-${{ github.run_number }}
@@ -52,7 +50,7 @@ jobs:
       PARALLELISM: ${{ inputs.parallelism }}
       TARGET_URL: ${{ inputs.target_url }}
       RUNNER_IMAGE: ghcr.io/juancastro14/k6-influxdb:latest
-      KUBECONFIG: ${{ github.workspace }}/.kubeconfig
+      KUBECONFIG: ${{ github.workspace }}\.kubeconfig
 
     steps:
       - name: Checkout
@@ -64,77 +62,101 @@ jobs:
           version: 'v1.30.0'
 
       - name: Write kubeconfig
+        env:
+          KUBECONFIG_DATA: ${{ secrets.KUBECONFIG_DATA }}
         run: |
-          if [ -z "${{ secrets.KUBECONFIG_DATA }}" ]; then
-            echo "::error::KUBECONFIG_DATA secret is not set. Configurar en Settings > Secrets and variables > Actions."
+          if ([string]::IsNullOrEmpty($env:KUBECONFIG_DATA)) {
+            Write-Error "KUBECONFIG_DATA secret is not set. Configurar en Settings > Secrets and variables > Actions."
             exit 1
-          fi
-          printf '%s' "${{ secrets.KUBECONFIG_DATA }}" | base64 -d > "$KUBECONFIG"
-          chmod 600 "$KUBECONFIG"
+          }
+          $bytes = [System.Convert]::FromBase64String($env:KUBECONFIG_DATA)
+          [System.IO.File]::WriteAllBytes($env:KUBECONFIG, $bytes)
 
       - name: Verify cluster access
         run: |
-          kubectl auth can-i create testruns.k6.io -n "$NAMESPACE"
-          kubectl -n "$NAMESPACE" get crd testruns.k6.io >/dev/null
+          kubectl auth can-i create testruns.k6.io -n $env:NAMESPACE
+          if ($LASTEXITCODE -ne 0) { exit 1 }
+          kubectl -n $env:NAMESPACE get crd testruns.k6.io | Out-Null
+          if ($LASTEXITCODE -ne 0) { exit 1 }
 
       - name: Resolve script path
         id: script
         run: |
-          SCRIPT_PATH="scripts/${SUITE}.js"
-          if [ ! -f "$SCRIPT_PATH" ]; then
-            echo "::error::Script no encontrado: $SCRIPT_PATH"
+          $scriptPath = "scripts/$($env:SUITE).js"
+          if (-not (Test-Path $scriptPath)) {
+            Write-Error "Script no encontrado: $scriptPath"
             exit 1
-          fi
-          echo "script_path=$SCRIPT_PATH" >> "$GITHUB_OUTPUT"
-          echo "script_file=${SUITE}.js" >> "$GITHUB_OUTPUT"
+          }
+          Add-Content -Path $env:GITHUB_OUTPUT -Value "script_path=$scriptPath"
+          Add-Content -Path $env:GITHUB_OUTPUT -Value "script_file=$($env:SUITE).js"
 
       - name: Create script ConfigMap
         run: |
-          kubectl create configmap "k6-script-${TEST_NAME}" \
-            --from-file="${{ steps.script.outputs.script_path }}" \
-            -n "$NAMESPACE" \
-            --dry-run=client -o yaml | kubectl apply -f -
+          $cmYaml = kubectl create configmap "k6-script-$($env:TEST_NAME)" `
+            --from-file="${{ steps.script.outputs.script_path }}" `
+            -n $env:NAMESPACE `
+            --dry-run=client -o yaml
+          if ($LASTEXITCODE -ne 0) { exit 1 }
+          $cmYaml | kubectl apply -f -
+          if ($LASTEXITCODE -ne 0) { exit 1 }
 
       - name: Render and apply TestRun
         env:
           SCRIPT_FILE: ${{ steps.script.outputs.script_file }}
         run: |
-          envsubst < manifests/testrun.template.yaml > /tmp/testrun.yaml
-          echo "::group::Rendered TestRun"
-          cat /tmp/testrun.yaml
-          echo "::endgroup::"
-          kubectl apply -f /tmp/testrun.yaml
+          $template = Get-Content -Path 'manifests/testrun.template.yaml' -Raw
+          $rendered = $template `
+            -replace '\$\{TEST_NAME\}',   $env:TEST_NAME `
+            -replace '\$\{NAMESPACE\}',   $env:NAMESPACE `
+            -replace '\$\{PARALLELISM\}', $env:PARALLELISM `
+            -replace '\$\{TARGET_URL\}',  $env:TARGET_URL `
+            -replace '\$\{SCRIPT_FILE\}', $env:SCRIPT_FILE `
+            -replace '\$\{RUNNER_IMAGE\}',$env:RUNNER_IMAGE
+          $tempPath = Join-Path $env:RUNNER_TEMP 'testrun.yaml'
+          Set-Content -Path $tempPath -Value $rendered -Encoding utf8
+          Write-Host "::group::Rendered TestRun"
+          Get-Content $tempPath
+          Write-Host "::endgroup::"
+          kubectl apply -f $tempPath
+          if ($LASTEXITCODE -ne 0) { exit 1 }
 
       - name: Wait for runners to start
         run: |
-          for i in $(seq 1 60); do
-            stage=$(kubectl -n "$NAMESPACE" get testrun "$TEST_NAME" -o jsonpath='{.status.stage}' 2>/dev/null || true)
-            echo "stage=${stage:-pending}"
-            if [ "$stage" = "started" ]; then
-              echo "Runners arrancaron."
+          for ($i = 1; $i -le 60; $i++) {
+            $stage = kubectl -n $env:NAMESPACE get testrun $env:TEST_NAME -o jsonpath='{.status.stage}' 2>$null
+            if (-not $stage) { $stage = "pending" }
+            Write-Host "stage=$stage"
+            if ($stage -eq "started") {
+              Write-Host "Runners arrancaron."
               break
-            fi
-            sleep 5
-          done
+            }
+            Start-Sleep -Seconds 5
+          }
 
       - name: Stream runner logs
         run: |
-          kubectl -n "$NAMESPACE" logs -l "k6_cr=$TEST_NAME" -f --tail=200 --max-log-requests=20 || true
+          kubectl -n $env:NAMESPACE logs -l "k6_cr=$($env:TEST_NAME)" -f --tail=200 --max-log-requests=20
+          # Ignorar el exit code: cuando los pods terminan kubectl logs sale con error.
+          exit 0
 
       - name: Final status
         if: always()
         run: |
-          echo "## Resultado del TestRun \`$TEST_NAME\`" >> "$GITHUB_STEP_SUMMARY"
-          stage=$(kubectl -n "$NAMESPACE" get testrun "$TEST_NAME" -o jsonpath='{.status.stage}' 2>/dev/null || echo "unknown")
-          echo "- **Stage final:** \`$stage\`" >> "$GITHUB_STEP_SUMMARY"
-          echo "- **Parallelism:** $PARALLELISM" >> "$GITHUB_STEP_SUMMARY"
-          echo "- **Target:** $TARGET_URL" >> "$GITHUB_STEP_SUMMARY"
-          echo "- **Suite:** $SUITE" >> "$GITHUB_STEP_SUMMARY"
-          echo "- **Metricas:** revisar el dashboard k6 en Grafana, filtrar por \`testid=$TEST_NAME\`" >> "$GITHUB_STEP_SUMMARY"
-          kubectl -n "$NAMESPACE" describe testrun "$TEST_NAME" | tail -40 || true
+          $stage = kubectl -n $env:NAMESPACE get testrun $env:TEST_NAME -o jsonpath='{.status.stage}' 2>$null
+          if (-not $stage) { $stage = "unknown" }
+          $summary = @"
+          ## Resultado del TestRun ``$($env:TEST_NAME)``
+          - **Stage final:** ``$stage``
+          - **Parallelism:** $($env:PARALLELISM)
+          - **Target:** $($env:TARGET_URL)
+          - **Suite:** $($env:SUITE)
+          - **Metricas:** revisar el dashboard k6 en Grafana, filtrar por ``testid=$($env:TEST_NAME)``
+          "@
+          Add-Content -Path $env:GITHUB_STEP_SUMMARY -Value $summary
+          kubectl -n $env:NAMESPACE describe testrun $env:TEST_NAME
 
       - name: Cleanup
         if: always()
         run: |
-          kubectl -n "$NAMESPACE" delete testrun "$TEST_NAME" --ignore-not-found
-          kubectl -n "$NAMESPACE" delete configmap "k6-script-${TEST_NAME}" --ignore-not-found
+          kubectl -n $env:NAMESPACE delete testrun $env:TEST_NAME --ignore-not-found
+          kubectl -n $env:NAMESPACE delete configmap "k6-script-$($env:TEST_NAME)" --ignore-not-found
