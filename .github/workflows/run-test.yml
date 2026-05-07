@@ -74,9 +74,10 @@ jobs:
 
       - name: Verify cluster access
         run: |
+          # Solo chequeamos lo que el SA esta autorizado a hacer en SU namespace.
+          # No tocamos CRDs porque eso seria cluster-scope y el SA no tiene ese
+          # permiso (correcto: el principio de least privilege).
           kubectl auth can-i create testruns.k6.io -n $env:NAMESPACE
-          if ($LASTEXITCODE -ne 0) { exit 1 }
-          kubectl -n $env:NAMESPACE get crd testruns.k6.io | Out-Null
           if ($LASTEXITCODE -ne 0) { exit 1 }
 
       - name: Resolve script path
@@ -123,7 +124,9 @@ jobs:
       - name: Wait for runners to start
         run: |
           for ($i = 1; $i -le 60; $i++) {
-            $stage = kubectl -n $env:NAMESPACE get testrun $env:TEST_NAME -o jsonpath='{.status.stage}' 2>$null
+            # --ignore-not-found devuelve vacio + exit 0 si todavia no esta
+            # visible, en lugar de stderr (que rompe el step en PS 5.1).
+            $stage = kubectl -n $env:NAMESPACE get testrun $env:TEST_NAME -o jsonpath='{.status.stage}' --ignore-not-found
             if (-not $stage) { $stage = "pending" }
             Write-Host "stage=$stage"
             if ($stage -eq "started") {
@@ -142,8 +145,8 @@ jobs:
       - name: Final status
         if: always()
         run: |
-          $stage = kubectl -n $env:NAMESPACE get testrun $env:TEST_NAME -o jsonpath='{.status.stage}' 2>$null
-          if (-not $stage) { $stage = "unknown" }
+          $stage = kubectl -n $env:NAMESPACE get testrun $env:TEST_NAME -o jsonpath='{.status.stage}' --ignore-not-found
+          if (-not $stage) { $stage = "unknown (TestRun no creado o ya borrado)" }
           $summary = @"
           ## Resultado del TestRun ``$($env:TEST_NAME)``
           - **Stage final:** ``$stage``
@@ -153,7 +156,7 @@ jobs:
           - **Metricas:** revisar el dashboard k6 en Grafana, filtrar por ``testid=$($env:TEST_NAME)``
           "@
           Add-Content -Path $env:GITHUB_STEP_SUMMARY -Value $summary
-          kubectl -n $env:NAMESPACE describe testrun $env:TEST_NAME
+          kubectl -n $env:NAMESPACE describe testrun $env:TEST_NAME --ignore-not-found
 
       - name: Cleanup
         if: always()
